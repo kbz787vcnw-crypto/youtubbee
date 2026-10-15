@@ -1,0 +1,122 @@
+import asyncio
+import logging
+import sqlite3
+import os
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from playwright.async_api import async_playwright
+logging.basicConfig(level=logging.INFO)
+PROFILES_DIR = Path("browser_profiles")
+PROFILES_DIR.mkdir(exist_ok=True)
+HEADLESS_MODE = os.getenv("HEADLESS", "false").lower() == "true"
+def init_db():
+with sqlite3.connect("youtube_bot.db") as conn:
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS accounts (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+email TEXT UNIQUE,
+proxy TEXT,
+status TEXT DEFAULT 'added'
+)
+""")
+conn.commit()
+init_db()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+keyboard = [
+[InlineKeyboardButton("1. Аккаунты и прокси", callback_data="tab_accounts")],
+[InlineKeyboardButton("2. Редактирование профиля", callback_data="tab_profile")],
+[InlineKeyboardButton("3. Автовыгрузка видео", callback_data="tab_upload")]
+]
+await update.message.reply_text("Главное меню управления YouTube:", reply_markup=InlineKeyboardMarkup(keyboard))
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+query = update.callback_query
+await query.answer()
+if query.data == "tab_accounts":
+keyboard = [
+[InlineKeyboardButton("➕ Добавить аккаунт + прокси", callback_data="add_acc_proxy")],
+[InlineKeyboardButton("📋 Список аккаунтов", callback_data="list_acc")],
+[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]
+]
+await query.message.edit_text("Управление аккаунтами и прокси:", reply_markup=InlineKeyboardMarkup(keyboard))
+elif query.data == "list_acc":
+with sqlite3.connect("youtube_bot.db") as conn:
+cursor = conn.cursor()
+cursor.execute("SELECT email, proxy, status FROM accounts")
+rows = cursor.fetchall()
+if not rows:
+await query.message.edit_text("Список аккаунтов пуст.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="tab_accounts")]]))
+return
+text = "📋 Список аккаунтов:\n\n"
+for email, proxy, status in rows:
+text += f"• ⁠{email}⁠\n  Прокси: ⁠{proxy}⁠\n  Статус: ⁠{status}⁠\n\n"
+await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="tab_accounts")]]))
+elif query.data == "tab_profile":
+await query.message.edit_text("Редактирование профилей: выберите аккаунты для массового или одиночного изменения.")
+elif query.data == "tab_upload":
+await query.message.edit_text("Автовыгрузка: укажите видеофайл, описание, теги и задержку между публикациями.")
+elif query.data == "add_acc_proxy":
+await query.message.reply_text("Отправь данные в формате:\n⁠email | ip:port:login:pass⁠", parse_mode="Markdown")
+context.user_data["state"] = "awaiting_acc_proxy"
+elif query.data == "main_menu":
+keyboard = [
+[InlineKeyboardButton("1. Аккаунты и прокси", callback_data="tab_accounts")],
+[InlineKeyboardButton("2. Редактирование профиля", callback_data="tab_profile")],
+[InlineKeyboardButton("3. Автовыгрузка видео", callback_data="tab_upload")]
+]
+await query.message.edit_text("Главное меню управления YouTube:", reply_markup=InlineKeyboardMarkup(keyboard))
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+state = context.user_data.get("state")
+text = update.message.text.strip()
+if state == "awaiting_acc_proxy":
+if "|" in text:
+parts = text.split("|")
+email = parts[0].strip()
+proxy_str = parts[1].strip()
+try:
+with sqlite3.connect("youtube_bot.db") as conn:
+cursor = conn.cursor()
+cursor.execute("INSERT OR IGNORE INTO accounts (email, proxy) VALUES (?, ?)", (email, proxy_str))
+conn.commit()
+await update.message.reply_text(f"Аккаунт {email} добавлен. Запускаю браузер для авторизации...")
+asyncio.create_task(run_browser_auth(email, proxy_str, update))
+except Exception as e:
+await update.message.reply_text(f"Ошибка базы данных: {e}")
+else:
+await update.message.reply_text("Неверный формат. Используй ⁠email | ip:port:login:pass⁠", parse_mode="Markdown")
+context.user_data["state"] = None
+async def run_browser_auth(email: str, proxy_str: str, update: Update):
+p_parts = proxy_str.split(":")
+proxy_config = {}
+if len(p_parts) >= 2:
+server = f"http://{p_parts[0]}:{p_parts[1]}"
+proxy_config["server"] = server
+if len(p_parts) >= 4:
+proxy_config["username"] = p_parts[2]
+proxy_config["password"] = p_parts[3]
+user_data_dir = PROFILES_DIR / email.replace("@", "at")
+async with async_playwright() as p:
+browser = await p.chromium.launch_persistent_context(
+user_data_dir=user_data_dir,
+headless=HEADLESS_MODE,
+proxy=proxy_config if proxy_config else None
+)
+page = await browser.new_page()
+try:
+await page.goto("https://accounts.google.com")
+await page.fill('input[type="email"]', email)
+await page.click('#identifierNext')
+await update.message.reply_text(f"Браузер для {email} запущен. Завершите вход и подтвердите при необходимости.")
+except Exception as e:
+logging.error(f"Auth error: {e}")
+await update.message.reply_text(f"Ошибка автоматизации для {email}: {e}")
+def main():
+token = "8911070749:AAHuVflIROa2f8bICeI7N9nZMCX_5buNCjM"
+app = Application.builder().token(token).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button_handler))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.run_polling()
+if name == "main":
+main
